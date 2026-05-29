@@ -118,6 +118,10 @@ model, scaler, meta = load_artifacts()
 features   = meta["features"]
 decode_map = meta["decode"]
 
+# Initialize Session State
+if "prediction" not in st.session_state:
+    st.session_state.prediction = None
+
 #  Constants 
 CROP_EMOJI = {
     'Irish-potato': '🥔', 'Tomato': '🍅', 'Groundnut': '🥜',
@@ -152,6 +156,26 @@ UNITS = {
 }
 
 features = ["N", "P", "K", "pH", "Temp", "Rainfall", "Salinity"]
+
+CORRELATION_MATRIX = np.array([
+    [ 1.0,  0.4,  0.4,  0.1,  0.0, -0.2,  0.1],  # N
+    [ 0.4,  1.0,  0.3,  0.1,  0.0, -0.2,  0.0],  # P
+    [ 0.4,  0.3,  1.0,  0.1,  0.0, -0.2,  0.1],  # K
+    [ 0.1,  0.1,  0.1,  1.0,  0.0, -0.5, -0.3],  # pH
+    [ 0.0,  0.0,  0.0,  0.0,  1.0, -0.3,  0.4],  # Temp
+    [-0.2, -0.2, -0.2, -0.5, -0.3,  1.0, -0.4],  # Rainfall
+    [ 0.1,  0.0,  0.1, -0.3,  0.4, -0.4,  1.0]   # Salinity
+])
+
+STATE_BASELINE = {
+    'pH': 6.2,
+    'N': 120.0,
+    'P': 50.0,
+    'K': 110.0,
+    'Temp': 20.0,
+    'Rainfall': 600.0,
+    'Salinity': 1.0
+}
 
 LGAs = {
     'Barkin Ladi', 'Bassa', 'Bokkos', 'Jos East', 'Jos North', 'Jos South',
@@ -244,8 +268,8 @@ st.markdown(f"""
     </div>
 """, unsafe_allow_html=True)
 
-#  Idle State ─
-if not predict_btn:
+#  Idle/Prediction State Check ─
+if st.session_state.prediction is None and not predict_btn:
     st.markdown(f"""
         <div style="background:{PANEL}; border:1.5px dashed {BORDER};
                     border-radius:12px; padding:48px 40px; text-align:center; margin-top:8px;">
@@ -258,39 +282,90 @@ if not predict_btn:
     """, unsafe_allow_html=True)
 
 else:
-    #  Prediction ─
-    user_input   = pd.DataFrame([[N, P, K, pH, Temp, Rainfall, Salinity]], columns=features)
-    input_scaled = scaler.transform(user_input)
-    pred_crop    = decode_map[model.predict(input_scaled)[0]]
-    crop_emoji   = CROP_EMOJI.get(pred_crop)
+    # Run prediction if button was clicked
+    if predict_btn:
+        user_input   = pd.DataFrame([[N, P, K, pH, Temp, Rainfall, Salinity]], columns=features)
+        input_scaled = scaler.transform(user_input)
+        pred_crop    = decode_map[model.predict(input_scaled)[0]]
+        crop_emoji   = CROP_EMOJI.get(pred_crop)
+        
+        st.session_state.prediction = {
+            "pred_crop": pred_crop,
+            "crop_emoji": crop_emoji,
+            "user_input": user_input,
+            "input_scaled": input_scaled,
+            "N": N, "P": P, "K": K, "pH": pH, "Temp": Temp, "Rainfall": Rainfall, "Salinity": Salinity
+        }
+    
+    # Retrieve active prediction snapshot from session state
+    pred = st.session_state.prediction
+    pred_crop = pred["pred_crop"]
+    crop_emoji = pred["crop_emoji"]
+    user_input = pred["user_input"]
+    input_scaled = pred["input_scaled"]
+    user_N = pred["N"]
+    user_P = pred["P"]
+    user_K = pred["K"]
+    user_pH = pred["pH"]
+    user_Temp = pred["Temp"]
+    user_Rainfall = pred["Rainfall"]
+    user_Salinity = pred["Salinity"]
 
     #  LGA Scoring 
     def lga_match_score(lga):
         climate = LGA_CLIMATE[lga]
         adj     = CLIMATE_ADJUSTMENTS[climate]
         bias    = LGA_SOIL_BIAS[lga]
-        checks  = {"Temp": Temp, "Rainfall": Rainfall, "pH": pH, "Salinity": Salinity}
-        score   = 0
+        
+        # 1. Construct user input vector in the exact order of features
+        user_vals = np.array([user_N, user_P, user_K, user_pH, user_Temp, user_Rainfall, user_Salinity])
+        
+        # 2. Extract means and stds in the exact order of features
+        mu = []
+        stds = []
+        for param in features:
+            stats = CROP_CONFIG[pred_crop][param]
+            mean = stats["mean"] + adj.get(param, 0.0) + bias.get(param, 0.0)
+            std = stats["std"] * 3.5  # standard deviation multiplier from data generator
+            mu.append(mean)
+            stds.append(std)
+            
+        mu = np.array(mu)
+        stds = np.array(stds)
+        
+        # 3. Construct covariance matrix Sigma
+        stds_diag = np.diag(stds)
+        Sigma = stds_diag @ CORRELATION_MATRIX @ stds_diag
+        
+        # 4. Invert covariance matrix with fallback
+        try:
+            inv_Sigma = np.linalg.inv(Sigma)
+            # 5. Compute squared Mahalanobis distance D_squared
+            diff = user_vals - mu
+            D_squared = diff @ inv_Sigma @ diff.T
+            # 6. Calculate continuous matching percentage
+            pct = int(round(np.exp(-0.05 * D_squared) * 100))
+        except np.linalg.LinAlgError:
+            pct = 1
+            
+        pct = int(np.clip(pct, 1, 100))
+        
+        # 7. Check which of the 4 display parameters fall within crop range
+        display_params = ["pH", "Salinity", "Temp", "Rainfall"]
         matched_params = []
-        for param, user_val in checks.items():
-            adjusted_mean = CROP_CONFIG[pred_crop][param]["mean"] + adj.get(param, 0) + bias.get(param, 0)
-            in_range = CROP_CONFIG[pred_crop][param]["min"] <= user_val <= CROP_CONFIG[pred_crop][param]["max"]
-            near_mean = abs(user_val - adjusted_mean) <= CROP_CONFIG[pred_crop][param]["std"]
-            if in_range:
-                score += 1
+        checks = {"Temp": user_Temp, "Rainfall": user_Rainfall, "pH": user_pH, "Salinity": user_Salinity}
+        for param in display_params:
+            if CROP_CONFIG[pred_crop][param]["min"] <= checks[param] <= CROP_CONFIG[pred_crop][param]["max"]:
                 matched_params.append(param)
-            if near_mean:
-                score += 1
-        return score, matched_params
+                
+        return pct, matched_params
 
     lga_results  = {lga: lga_match_score(lga) for lga in LGAs}
     sorted_lgas  = sorted(lga_results, key=lambda l: lga_results[l][0], reverse=True)
     top_lgas     = sorted_lgas[:3]
-    max_score    = 8  # max possible score (4 params × 2 checks)
 
-    def build_lga_explanation(lga, score, matched_params):
+    def build_lga_explanation(lga, pct, matched_params):
         climate   = LGA_CLIMATE[lga]
-        pct       = int(round(score / max_score * 100))
         adj       = CLIMATE_ADJUSTMENTS[climate]
         temp_dir  = "cooler" if adj["Temp"] < 0 else "warmer"
         rain_dir  = "higher" if adj["Rainfall"] > 0 else "lower"
@@ -338,10 +413,9 @@ else:
 
     cols = st.columns(3)
     for i, (col, lga) in enumerate(zip(cols, top_lgas)):
-        score, matched = lga_results[lga]
-        pct    = int(round(score / max_score * 100))
+        pct, matched = lga_results[lga]
         climate = LGA_CLIMATE[lga]
-        explanation = build_lga_explanation(lga, score, matched)
+        explanation = build_lga_explanation(lga, pct, matched)
         fill_pct = pct
 
         with col:
@@ -401,7 +475,7 @@ else:
         """, unsafe_allow_html=True)
 
         params = ["N", "P", "K", "pH", "Temp", "Rainfall", "Salinity"]
-        user_vals = [N, P, K, pH, Temp, Rainfall, Salinity]
+        user_vals = [user_N, user_P, user_K, user_pH, user_Temp, user_Rainfall, user_Salinity]
 
         fig, axes = plt.subplots(len(params), 1, figsize=(5.2, 6.0))
         fig.patch.set_facecolor(PANEL)
@@ -544,3 +618,142 @@ else:
             </p>
         </div>
     """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:36px;'></div>", unsafe_allow_html=True)
+    st.markdown(f"<hr style='border-color:{BORDER};'>", unsafe_allow_html=True)
+
+    #  Granular LGA Analysis (Suitability Table) ─
+    st.markdown(f"""
+        <p style="color:{MUTED}; font-size:0.7em; letter-spacing:0.18em;
+                  text-transform:uppercase; margin:0 0 14px 0;">
+            Granular Analysis — Location Suitability Detail
+        </p>
+    """, unsafe_allow_html=True)
+
+    # LGA selector dropdown directly in the main panel
+    default_lga_index = sorted(list(LGAs)).index(top_lgas[0]) if top_lgas[0] in LGAs else 0
+    selected_lga = st.selectbox(
+        "Select Location (LGA) to analyze baseline suitability:", 
+        sorted(list(LGAs)), 
+        index=default_lga_index
+    )
+
+    # Calculate typical values for the user's selected LGA using the state baseline
+    selected_climate = LGA_CLIMATE[selected_lga]
+    selected_adj = CLIMATE_ADJUSTMENTS[selected_climate]
+    selected_bias = LGA_SOIL_BIAS[selected_lga]
+
+    typical_vals = {}
+    for param in features:
+        mean_val = STATE_BASELINE[param]
+        mean_val += selected_adj.get(param, 0.0)
+        mean_val += selected_bias.get(param, 0.0)
+        typical_vals[param] = round(mean_val, 2)
+
+    # Build HTML rows for the suitability table (comparing Typical LGA vs Crop Ideal)
+    table_rows = ""
+    for param in features:
+        typ_val = typical_vals[param]
+        lo = CROP_CONFIG[pred_crop][param]["min"]
+        hi = CROP_CONFIG[pred_crop][param]["max"]
+        unit = UNITS[param]
+
+        if typ_val < lo:
+            status_html = f"<span style='color:#c0392b; font-weight:bold;'>Deficient ✗ (Needs +{round(lo - typ_val, 2)} {unit})</span>"
+        elif typ_val > hi:
+            status_html = f"<span style='color:#d35400; font-weight:bold;'>Excessive ✗ (Over by {round(typ_val - hi, 2)} {unit})</span>"
+        else:
+            status_html = f"<span style='color:{LEAF}; font-weight:bold;'>Optimal ✓</span>"
+
+        table_rows += f"""<tr style="border-bottom: 1px solid {BORDER};">
+<td style="padding: 10px 8px; color:{INK}; font-weight: 500;">{param} ({unit})</td>
+<td style="padding: 10px 8px; color:{MUTED};">{typ_val}</td>
+<td style="padding: 10px 8px; color:{MUTED};">{lo} - {hi}</td>
+<td style="padding: 10px 8px;">{status_html}</td>
+</tr>"""
+
+    html_str = f"""
+<div style="background:{PANEL}; border:1.5px solid {BORDER};
+            border-radius:10px; padding:24px 28px; margin-bottom:28px;
+            box-shadow:0 2px 8px rgba(0,0,0,0.05);">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid {BORDER}; padding-bottom: 12px; margin-bottom: 16px;">
+        <h3 style="margin: 0; color: {INK}; font-family: 'Playfair Display', serif; font-size: 1.4em;">
+            📍 Suitability Report for {selected_lga} LGA
+        </h3>
+        <span style="background: {BG}; color: {SOIL}; font-size: 0.75em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; padding: 4px 10px; border-radius: 20px;">
+            {selected_climate} Zone
+        </span>
+    </div>
+    <p style="color:{MUTED}; font-size:0.85em; margin:0 0 16px 0; line-height: 1.55;">
+        {LGA_DESCRIPTION[selected_lga]} Here is how the typical soil/climate baseline of <strong>{selected_lga}</strong> compares to the ideal ranges for <strong>{pred_crop}</strong>.
+    </p>
+    <table style="width:100%; border-collapse: collapse; text-align: left; font-size: 0.88em;">
+        <thead>
+            <tr style="border-bottom: 2px solid {BORDER}; color: {INK}; font-weight: 600;">
+                <th style="padding: 8px;">Parameter</th>
+                <th style="padding: 8px;">Typical {selected_lga}</th>
+                <th style="padding: 8px;">Ideal {pred_crop} Range</th>
+                <th style="padding: 8px;">LGA Status</th>
+            </tr>
+        </thead>
+        <tbody>
+{table_rows}
+        </tbody>
+    </table>
+</div>
+"""
+    st.markdown(html_str, unsafe_allow_html=True)
+
+    # Build structured text report with ASCII table
+    report_text = f"""PLATEAU STATE CROP ADVISOR REPORT
+================================================================================
+RECOMMENDED CROP: {pred_crop.upper()}
+Selected LGA Suitability: {selected_lga} ({selected_climate} Zone)
+
+Description:
+{LGA_DESCRIPTION[selected_lga]}
+
+SUITABILITY ANALYSIS FOR {selected_lga} LGA:
++-------------------+-------------------+-------------------+---------------------------+
+| Parameter         | Typical LGA Value | Ideal Crop Range  | Suitability Status        |
++-------------------+-------------------+-------------------+---------------------------+
+"""
+    for param in features:
+        typ_val = typical_vals[param]
+        lo = CROP_CONFIG[pred_crop][param]["min"]
+        hi = CROP_CONFIG[pred_crop][param]["max"]
+        unit = UNITS[param]
+
+        param_str = f"{param} ({unit})"
+        typ_str = f"{typ_val}"
+        range_str = f"{lo} - {hi}"
+
+        status = "Optimal"
+        if typ_val < lo:
+            status = f"Deficient (Needs +{round(lo - typ_val, 2)})"
+        elif typ_val > hi:
+            status = f"Excessive (Over by {round(typ_val - hi, 2)})"
+
+        report_text += f"| {param_str:<17} | {typ_str:<17} | {range_str:<17} | {status:<25} |\n"
+
+    report_text += f"""+-------------------+-------------------+-------------------+---------------------------+
+
+TOP 3 GENERAL BEST-MATCHING LGAS FOR {pred_crop.upper()}:
+"""
+    for rank, lga in enumerate(top_lgas, 1):
+        pct, matched = lga_results[lga]
+        report_text += f"{rank}. {lga:<18} ({LGA_CLIMATE[lga]} Zone) - {pct}% match (Key matches: {', '.join(matched) if matched else 'none'})\n"
+
+    report_text += "\nReport generated by Plateau Crop Advisor AI. All values are advisory based on machine learning modeling.\n"
+    report_text += "================================================================================"
+
+    col_dl, col_space = st.columns([1, 2])
+    with col_dl:
+        st.download_button(
+            label="📥 Download Advisor Report",
+            data=report_text,
+            file_name=f"crop_advisor_report_{pred_crop.lower()}.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
+    st.markdown("<div style='margin-bottom: 28px;'></div>", unsafe_allow_html=True)
